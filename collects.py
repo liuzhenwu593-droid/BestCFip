@@ -526,7 +526,7 @@ def main():
         # 方式1: 排除美国，保留其他所有国家
         collector = CloudflareIPCollector(
             port='8443',
-            exclude_countries=['US'],  # 🚫 排除美国
+            include_countries=['US'],  # 🚫 排除美国
             timeout=15,
             max_retries=3
         )
