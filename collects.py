@@ -524,13 +524,12 @@ def main():
         # ========== 在这里配置过滤选项 ==========
         
         # 方式1: 排除美国，保留其他所有国家
-        
-collector = CloudflareIPCollector(
-             port='8443',
-             include_countries=['HK', 'KR', 'SG', 'JP'],  # ✅ 只包含这些国家
-             timeout=15,
-             max_retries=3
-         )
+        collector = CloudflareIPCollector(
+            port='8443',
+            exclude_countries=['US'],  # 🚫 排除美国
+            timeout=15,
+            max_retries=3
+        )
         
         # 方式2: 只保留中国、香港、新加坡
         # collector = CloudflareIPCollector(
