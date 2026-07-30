@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 
 """
-Cloudflare IP地址收集器
-从多个源收集Cloudflare IPv4和IPv6地址，并自动分类保存
+Cloudflare IP地址收集器 - 完整版
+从多个源收集Cloudflare IPv4和IPv6地址，支持国家过滤
 """
 
 import requests
@@ -30,20 +30,38 @@ logger = logging.getLogger(__name__)
 
 
 class CloudflareIPCollector:
-    """Cloudflare IP地址收集器"""
+    """Cloudflare IP地址收集器 - 支持国家过滤"""
     
-    def __init__(self, port: str = '8443', timeout: int = 10, max_retries: int = 3):
+    def __init__(self, 
+                 port: str = '8443', 
+                 exclude_countries: List[str] = None,
+                 include_countries: List[str] = None,
+                 timeout: int = 10, 
+                 max_retries: int = 3,
+                 enable_ipv6_location: bool = False):
         """
         初始化收集器
         
         Args:
             port: 目标端口号
+            exclude_countries: 要排除的国家列表 (如 ['US', 'JP'])
+            include_countries: 只包含这些国家 (如 ['CN', 'HK', 'SG'])
             timeout: 请求超时时间（秒）
             max_retries: 最大重试次数
+            enable_ipv6_location: 是否启用IPv6地理位置查询（较慢）
         """
         self.port = port
+        self.exclude_countries = exclude_countries or []
+        self.include_countries = include_countries or []
         self.timeout = timeout
         self.max_retries = max_retries
+        self.enable_ipv6_location = enable_ipv6_location
+        
+        # 显示过滤条件
+        if self.exclude_countries:
+            logger.info(f"🚫 排除国家: {', '.join(self.exclude_countries)}")
+        if self.include_countries:
+            logger.info(f"✅ 只包含国家: {', '.join(self.include_countries)}")
         
         # IP地址数据源
         self.sources = {
@@ -82,6 +100,7 @@ class CloudflareIPCollector:
             'failed_sources': 0,
             'ipv4_count': 0,
             'ipv6_count': 0,
+            'filtered_count': 0,
             'errors': []
         }
         
@@ -212,15 +231,38 @@ class CloudflareIPCollector:
         elif isinstance(data, str):
             text_parts.append(data)
     
-    def _get_ip_location(self, ip: str) -> str:
+    def _is_valid_country(self, country: str) -> bool:
         """
-        获取IP的地理位置信息
+        检查国家是否有效
+        
+        Args:
+            country: 国家代码
+            
+        Returns:
+            True表示有效，False表示被过滤
+        """
+        if not country or country == 'UNKNOWN':
+            return False
+        
+        # 先检查排除列表
+        if self.exclude_countries and country in self.exclude_countries:
+            return False
+        
+        # 再检查包含列表
+        if self.include_countries and country not in self.include_countries:
+            return False
+        
+        return True
+    
+    def _get_ip_location(self, ip: str) -> Tuple[str, bool]:
+        """
+        获取IP的地理位置信息并检查有效性
         
         Args:
             ip: IP地址
             
         Returns:
-            国家代码，失败返回'UNKNOWN'
+            (国家代码, 是否有效)
         """
         try:
             response = self.session.get(
@@ -230,10 +272,37 @@ class CloudflareIPCollector:
             )
             if response.status_code == 200:
                 country = response.text.strip()
-                return country if country else 'UNKNOWN'
-            return 'UNKNOWN'
+                is_valid = self._is_valid_country(country)
+                return country, is_valid
+            return 'UNKNOWN', False
         except Exception:
-            return 'UNKNOWN'
+            return 'UNKNOWN', False
+    
+    def _get_ip_location_detailed(self, ip: str) -> Tuple[str, str, bool]:
+        """
+        获取IP的详细地理位置信息
+        
+        Args:
+            ip: IP地址
+            
+        Returns:
+            (国家代码, 城市, 是否有效)
+        """
+        try:
+            response = self.session.get(
+                f"https://ipinfo.io/{ip}/json",
+                headers=self.headers,
+                timeout=5
+            )
+            if response.status_code == 200:
+                data = response.json()
+                country = data.get('country', 'UNKNOWN')
+                city = data.get('city', '')
+                is_valid = self._is_valid_country(country)
+                return country, city, is_valid
+            return 'UNKNOWN', '', False
+        except Exception:
+            return 'UNKNOWN', '', False
     
     def _extract_ips_from_text(self, text: str, source_name: str):
         """
@@ -250,17 +319,22 @@ class CloudflareIPCollector:
         for ip in ipv4_set:
             try:
                 if ipaddress.ip_address(ip).version == 4:
-                    # 检查是否已存在
                     ip_with_port = f"{ip}:{self.port}"
                     if ip_with_port not in self.ipv4_data:
-                        # 获取地理位置
-                        location = self._get_ip_location(ip)
-                        comment = f"{location}-{uuid.uuid4().hex[27:]}{random.randint(0, 10)}"
+                        # 获取地理位置并检查是否有效
+                        country, is_valid = self._get_ip_location(ip)
+                        
+                        # 如果无效，跳过
+                        if not is_valid:
+                            self.stats['filtered_count'] += 1
+                            continue
+                        
+                        comment = f"{country}-{uuid.uuid4().hex[27:]}{random.randint(0, 10)}"
                         self.ipv4_data[ip_with_port] = comment
             except ValueError:
                 continue
         
-        # 提取IPv6地址（改进的正则表达式）
+        # 提取IPv6地址
         ipv6_pattern = r'(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|' \
                       r'(?:[0-9a-fA-F]{1,4}:){1,7}:|' \
                       r'(?:[0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|' \
@@ -271,8 +345,7 @@ class CloudflareIPCollector:
                       r'[0-9a-fA-F]{1,4}:(?::[0-9a-fA-F]{1,4}){1,6}|' \
                       r':(?:(?::[0-9a-fA-F]{1,4}){1,7}|:)|' \
                       r'fe80:(?::[0-9a-fA-F]{0,4}){0,4}%[0-9a-zA-Z]+|' \
-                      r'::(?:ffff(?::0{1,4})?:)?(?:(?:25[0-5]|(?:2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3}(?:25[0-5]|(?:2[0-4]|1{0,1}[0-9]){0,1}[0-9])|' \
-                      r'(?:[0-9a-fA-F]{1,4}:){1,4}:(?:(?:25[0-5]|(?:2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3}(?:25[0-5]|(?:2[0-4]|1{0,1}[0-9]){0,1}[0-9])'
+                      r'::(?:ffff(?::0{1,4})?:)?(?:(?:25[0-5]|(?:2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3}(?:25[0-5]|(?:2[0-4]|1{0,1}[0-9]){0,1}[0-9])'
         
         ipv6_set = set(re.findall(ipv6_pattern, text))
         
@@ -282,7 +355,16 @@ class CloudflareIPCollector:
                 if ip_obj.version == 6:
                     ip_with_port = f"[{ip_obj.compressed}]:{self.port}"
                     if ip_with_port not in self.ipv6_data:
-                        comment = f"{source_name}-{uuid.uuid4().hex[27:]}{random.randint(0, 10)}"
+                        # IPv6地理位置查询（可选，较慢）
+                        if self.enable_ipv6_location:
+                            country, _, is_valid = self._get_ip_location_detailed(ip)
+                            if not is_valid:
+                                self.stats['filtered_count'] += 1
+                                continue
+                            comment = f"{country}-{uuid.uuid4().hex[27:]}{random.randint(0, 10)}"
+                        else:
+                            comment = f"{source_name}-{uuid.uuid4().hex[27:]}{random.randint(0, 10)}"
+                        
                         self.ipv6_data[ip_with_port] = comment
             except ValueError:
                 continue
@@ -290,11 +372,11 @@ class CloudflareIPCollector:
     def collect(self):
         """从所有源收集IP地址"""
         logger.info("=" * 60)
-        logger.info("开始收集Cloudflare IP地址")
+        logger.info("🚀 开始收集Cloudflare IP地址")
         logger.info("=" * 60)
         
         for url, source_name in self.sources.items():
-            logger.info(f"正在处理: {source_name} ({url})")
+            logger.info(f"📡 正在处理: {source_name} ({url})")
             
             content = self._fetch_content(url)
             if content is None:
@@ -309,7 +391,7 @@ class CloudflareIPCollector:
             # 提取IP地址
             self._extract_ips_from_text(text, source_name)
             
-            logger.info(f"  当前已收集: IPv4={len(self.ipv4_data)}, IPv6={len(self.ipv6_data)}")
+            logger.info(f"   📊 当前已收集: IPv4={len(self.ipv4_data)}, IPv6={len(self.ipv6_data)}, 已过滤={self.stats['filtered_count']}")
     
     def _validate_ips(self):
         """验证IP地址的有效性"""
@@ -357,13 +439,24 @@ class CloudflareIPCollector:
         self.stats['ipv4_count'] = len(self.ipv4_data)
         self.stats['ipv6_count'] = len(self.ipv6_data)
         
+        # 构建过滤信息
+        filter_info = ""
+        if self.exclude_countries:
+            filter_info += f"排除: {', '.join(self.exclude_countries)} "
+        if self.include_countries:
+            filter_info += f"包含: {', '.join(self.include_countries)}"
+        if not filter_info:
+            filter_info = "无过滤"
+        
         # 保存IPv4
         ipv4_path = os.path.join(output_dir, 'ipv4.txt')
         try:
             with open(ipv4_path, 'w', encoding='utf-8') as f:
                 f.write(f"ipv4.list.updated.at#Upd{timestamp}\n")
-                f.write(f"# Total: {len(self.ipv4_data)} IPs\n")
-                f.write(f"# Source: {self.stats['success_sources']} sources\n")
+                f.write(f"# 总数: {len(self.ipv4_data)} 个IP\n")
+                f.write(f"# 来源: {self.stats['success_sources']} 个数据源\n")
+                f.write(f"# 过滤: {filter_info}\n")
+                f.write(f"# 过滤数: {self.stats['filtered_count']} 个\n")
                 f.write("#" + "=" * 58 + "\n")
                 
                 for ip_with_port in sorted(self.ipv4_data.keys()):
@@ -379,8 +472,9 @@ class CloudflareIPCollector:
         try:
             with open(ipv6_path, 'w', encoding='utf-8') as f:
                 f.write(f"ipv6.list.updated.at#Upd{timestamp}\n")
-                f.write(f"# Total: {len(self.ipv6_data)} IPs\n")
-                f.write(f"# Source: {self.stats['success_sources']} sources\n")
+                f.write(f"# 总数: {len(self.ipv6_data)} 个IP\n")
+                f.write(f"# 来源: {self.stats['success_sources']} 个数据源\n")
+                f.write(f"# 过滤: {filter_info}\n")
                 f.write("#" + "=" * 58 + "\n")
                 
                 for ip_with_port in sorted(self.ipv6_data.keys()):
@@ -403,16 +497,22 @@ class CloudflareIPCollector:
     def print_statistics(self):
         """打印统计信息"""
         logger.info("=" * 60)
-        logger.info("收集完成 - 统计信息")
+        logger.info("📊 收集完成 - 统计信息")
         logger.info("=" * 60)
-        logger.info(f"总数据源: {self.stats['total_sources']}")
-        logger.info(f"成功: {self.stats['success_sources']}")
-        logger.info(f"失败: {self.stats['failed_sources']}")
-        logger.info(f"IPv4地址: {self.stats['ipv4_count']}")
-        logger.info(f"IPv6地址: {self.stats['ipv6_count']}")
+        logger.info(f"📁 总数据源: {self.stats['total_sources']}")
+        logger.info(f"✅ 成功: {self.stats['success_sources']}")
+        logger.info(f"❌ 失败: {self.stats['failed_sources']}")
+        logger.info(f"🌐 IPv4地址: {self.stats['ipv4_count']}")
+        logger.info(f"🌐 IPv6地址: {self.stats['ipv6_count']}")
+        logger.info(f"🚫 已过滤: {self.stats['filtered_count']}")
+        
+        if self.exclude_countries:
+            logger.info(f"🚫 排除国家: {', '.join(self.exclude_countries)}")
+        if self.include_countries:
+            logger.info(f"✅ 包含国家: {', '.join(self.include_countries)}")
         
         if self.stats['errors']:
-            logger.warning(f"错误列表 ({len(self.stats['errors'])} 条):")
+            logger.warning(f"⚠️ 错误列表 ({len(self.stats['errors'])} 条):")
             for error in self.stats['errors'][:5]:  # 只显示前5条
                 logger.warning(f"  - {error}")
         logger.info("=" * 60)
@@ -421,12 +521,43 @@ class CloudflareIPCollector:
 def main():
     """主函数"""
     try:
-        # 创建收集器
-        collector = CloudflareIPCollector(
-            port='8443',
-            timeout=15,
-            max_retries=3
-        )
+        # ========== 在这里配置过滤选项 ==========
+        
+        # 方式1: 排除美国，保留其他所有国家
+        
+collector = CloudflareIPCollector(
+             port='8443',
+             include_countries=['HK', 'KR', 'SG', 'JP'],  # ✅ 只包含这些国家
+             timeout=15,
+             max_retries=3
+         )
+        
+        # 方式2: 只保留中国、香港、新加坡
+        # collector = CloudflareIPCollector(
+        #     port='8443',
+        #     include_countries=['CN', 'HK', 'SG'],  # ✅ 只包含这些国家
+        #     timeout=15,
+        #     max_retries=3
+        # )
+        
+        # 方式3: 排除多个国家
+        # collector = CloudflareIPCollector(
+        #     port='8443',
+        #     exclude_countries=['US', 'JP', 'KR', 'DE'],  # 排除美国、日本、韩国、德国
+        #     timeout=15,
+        #     max_retries=3
+        # )
+        
+        # 方式4: 只包含中国，并排除美国（排除优先）
+        # collector = CloudflareIPCollector(
+        #     port='8443',
+        #     exclude_countries=['US'],
+        #     include_countries=['CN', 'HK', 'TW', 'SG'],
+        #     timeout=15,
+        #     max_retries=3
+        # )
+        
+        # ======================================
         
         # 开始收集
         collector.collect()
@@ -438,9 +569,9 @@ def main():
         collector.print_statistics()
         
     except KeyboardInterrupt:
-        logger.info("\n用户中断执行")
+        logger.info("\n⚠️ 用户中断执行")
     except Exception as e:
-        logger.error(f"程序执行失败: {e}", exc_info=True)
+        logger.error(f"❌ 程序执行失败: {e}", exc_info=True)
         return 1
     
     return 0
