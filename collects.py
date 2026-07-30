@@ -19,7 +19,7 @@ sources = {
     'https://raw.githubusercontent.com/xingpingcn/enhanced-FaaS-in-China/refs/heads/main/Cf.json': 'FaaS'
 }
 
-PORT = '443'  # 目标端口号
+PORT = '8443'  # 目标端口号
 
 # 正则表达式
 ipv4_pattern = r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b'
